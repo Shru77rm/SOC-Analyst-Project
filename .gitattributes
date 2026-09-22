@@ -1,0 +1,11 @@
+# Files that are read inside Linux containers must keep LF line endings even when checked out on Windows
+# (core.autocrlf=true would otherwise turn them into CRLF and break shell/nginx/Logstash parsing).
+Dockerfile          text eol=lf
+*.dockerignore      text eol=lf
+.dockerignore       text eol=lf
+docker-compose*.yml text eol=lf
+*.template          text eol=lf
+*.conf              text eol=lf
+*.sh                text eol=lf
+elk/**              text eol=lf
+sample_logs/**      text eol=lf

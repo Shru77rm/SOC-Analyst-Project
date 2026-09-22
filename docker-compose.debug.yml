@@ -1,0 +1,15 @@
+# Debug overlay: publishes the internal services on 127.0.0.1 ONLY (never on the network) and turns up logging.
+#   docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d
+# API docs then live at http://127.0.0.1:8000/docs, Elasticsearch at http://127.0.0.1:9200, MongoDB on 127.0.0.1:27017.
+services:
+  backend:
+    environment:
+      LOG_LEVEL: DEBUG
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+  elasticsearch:
+    ports:
+      - "127.0.0.1:${ES_PORT:-9200}:9200"
+  mongodb:
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"

@@ -1,0 +1,177 @@
+# AI-Powered SOC Analyst - complete stack.
+#
+#   1. python scripts/docker/init_env.py          # creates .env with generated secrets (never overwrites; not committed)
+#   2. docker compose up -d --build               # first build trains the demo models (~2-4 min, ~2 GB image)
+#   3. open http://localhost:8080                 # sign in with the SEED_* users from .env
+#
+# Optional: docker compose --profile kibana up -d          (adds Kibana on http://127.0.0.1:5601)
+#           docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d   (publishes API/ES/Mongo on 127.0.0.1)
+#
+# Startup order (each arrow waits for the dependency's HEALTHCHECK to pass):
+#   mongodb ─┐
+#            ├─► backend ─► frontend (nginx)
+#   elasticsearch ─┤
+#                  └─► logstash            (Logstash -> Elasticsearch -> backend consumer)
+#
+# Only the UI is published to the network. Everything else is reachable only on the compose network (or 127.0.0.1).
+# DEV/DEMO configuration: Elasticsearch runs with security disabled, no TLS anywhere. Read docs/docker.md before exposing it.
+name: soc-analyst
+
+services:
+  # ------------------------------------------------------------------------------------------------ MongoDB
+  mongodb:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-soc}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env (python scripts/docker/init_env.py)}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username \"$$MONGO_INITDB_ROOT_USERNAME\" --password \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 10
+      start_period: 20s
+
+  # ------------------------------------------------------------------------------------------------ Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.5
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"          # DEV ONLY - see docs/docker.md
+      xpack.ml.enabled: "false"
+      ingest.geoip.downloader.enabled: "false"
+      ES_JAVA_OPTS: -Xms${ES_HEAP:-512m} -Xmx${ES_HEAP:-512m}
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  # ------------------------------------------------------------------------------------------------ Backend API
+  backend:
+    build:
+      context: .                                # repo root: the image needs backend/ and ml/
+      dockerfile: backend/Dockerfile
+    image: soc-analyst/backend:local
+    restart: unless-stopped
+    depends_on:
+      mongodb: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${UI_PORT:-8080}}      # the UI is same-origin via nginx; this is only a guard
+      # -- secrets: required, never defaulted, never in the image
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (python scripts/docker/init_env.py)}
+      SEED_ADMIN_USERNAME: ${SEED_ADMIN_USERNAME:-admin}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:?set SEED_ADMIN_PASSWORD in .env}
+      SEED_ANALYST_USERNAME: ${SEED_ANALYST_USERNAME:-analyst}
+      SEED_ANALYST_PASSWORD: ${SEED_ANALYST_PASSWORD:?set SEED_ANALYST_PASSWORD in .env}
+      INGEST_API_KEY: ${INGEST_API_KEY:-}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      # -- data stores (service names resolve on the compose network)
+      MONGO_URI: mongodb://${MONGO_ROOT_USER:-soc}:${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}@mongodb:27017/?authSource=admin
+      MONGO_DB: ${MONGO_DB:-soc_analyst}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_INDEX_PREFIX: ${ES_INDEX_PREFIX:-soc-events}
+      # in a container a silent NON-persistent fallback is a trap: fail (and restart) instead
+      ALLOW_MEMORY_FALLBACK: ${ALLOW_MEMORY_FALLBACK:-false}
+      # -- Logstash -> Elasticsearch -> backend consumer
+      LOGSTASH_CONSUMER_ENABLED: ${LOGSTASH_CONSUMER_ENABLED:-true}
+      LOGSTASH_CONSUMER_INTERVAL_SECONDS: ${LOGSTASH_CONSUMER_INTERVAL_SECONDS:-2}
+      LOGSTASH_CONSUMER_BATCH: ${LOGSTASH_CONSUMER_BATCH:-200}
+      # -- AI summaries: 'template' needs no external call. 'anthropic' needs ANTHROPIC_API_KEY.
+      AI_SUMMARY_PROVIDER: ${AI_SUMMARY_PROVIDER:-template}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_SUMMARY_MODEL: ${AI_SUMMARY_MODEL:-claude-opus-5}
+      DEMO_MODE_ENABLED: ${DEMO_MODE_ENABLED:-true}
+    healthcheck:                                 # also defined in the Dockerfile; repeated so `docker compose config` shows it
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 120s
+
+  # ------------------------------------------------------------------------------------------------ Logstash
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.19.5
+    restart: unless-stopped
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx${LOGSTASH_HEAP:-512m}
+      ES_HOSTS: http://elasticsearch:9200
+      ES_INDEX_PREFIX: ${ES_INDEX_PREFIX:-soc-events}       # must equal the backend's ELASTICSEARCH_INDEX_PREFIX (one variable feeds both)
+      SAMPLE_LOG_DIR: /usr/share/logstash/sample_logs
+      FILE_INPUT_MODE: tail
+      TCP_PORT: "5000"
+      BEATS_PORT: "5044"
+    ports:
+      - "127.0.0.1:${LOGSTASH_TCP_PORT:-5000}:5000"          # plain-text / JSON lines
+      - "127.0.0.1:${LOGSTASH_BEATS_PORT:-5044}:5044"        # Filebeat / Elastic Agent
+    volumes:
+      - ./elk/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./elk/logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./elk/elasticsearch/soc-events-template.json:/usr/share/logstash/config/soc-events-template.json:ro
+      # SYNTHETIC sample logs. To start WITHOUT them set SAMPLE_LOGS_DIR=./elk/no-samples in .env
+      - ${SAMPLE_LOGS_DIR:-./sample_logs}:/usr/share/logstash/sample_logs:ro
+      - ls_data:/usr/share/logstash/data                     # remembers read positions across restarts
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/_node/pipelines/soc > /dev/null"]
+      interval: 15s
+      timeout: 8s
+      retries: 12
+      start_period: 90s
+
+  # ------------------------------------------------------------------------------------------------ UI + reverse proxy
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: soc-analyst/frontend:local
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_healthy }
+    environment:
+      API_UPSTREAM: http://backend:8000
+    ports:
+      - "${UI_PORT:-8080}:8080"                              # the ONLY port published to the network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 4s
+      retries: 3
+      start_period: 10s
+
+  # ------------------------------------------------------------------------------------------------ Kibana (optional)
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.19.5
+    profiles: ["kibana"]
+    restart: unless-stopped
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      NODE_OPTIONS: --max-old-space-size=768
+    ports:
+      - "127.0.0.1:${KIBANA_PORT:-5601}:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status > /dev/null"]
+      interval: 15s
+      timeout: 8s
+      retries: 20
+      start_period: 60s
+
+volumes:
+  mongo_data:
+  es_data:
+  ls_data:

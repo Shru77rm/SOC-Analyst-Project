@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Secrets / local config  (never commit real secrets)
+.env
+.env.*
+!.env.example
+
+# ML artifacts are build outputs, regenerate with `python -m ml.training.train`
+ml/models/*
+!ml/models/.gitkeep
+ml/data/generated/
+
+# Local runtime data
+*.log
+logs/
+data/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Frontend local test output
+frontend/tests/e2e/out/
+frontend/.env.local
+
+# The bundled SYNTHETIC sample logs ARE source data (the blanket *.log rule above is for runtime logs)
+!sample_logs/*.log
